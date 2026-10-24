@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cheating detector</title>
+<style>
+  body { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #fff; text-align: center; }
+  #wrap { position: relative; max-width: 480px; margin: 0 auto; border: 6px solid transparent; box-sizing: border-box; }
+  #wrap.alert { border-color: #f33; }
+  video { width: 100%; transform: scaleX(-1); background: #000; display: block; }
+  #status { position: absolute; top: 10px; left: 0; right: 0; font-size: 22px; font-weight: bold; text-shadow: 0 0 6px #000; }
+  #arrows { position: absolute; top: 50%; left: 0; right: 0; display: flex; justify-content: space-between; padding: 0 12px;
+            font-size: 64px; font-weight: bold; color: #f33; text-shadow: 0 0 8px #000; pointer-events: none; }
+  #arrows span { visibility: hidden; }
+  .ctl { padding: 10px 16px; }
+  button { font-size: 18px; padding: 12px 24px; border: 0; border-radius: 10px; background: #2d7ff9; color: #fff; margin: 4px; }
+  input[type=range] { width: 70%; }
+  #msg { padding: 8px 16px; color: #aaa; font-size: 14px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="video" autoplay playsinline muted></video>
+  <div id="status">Tap Start</div>
+  <div id="arrows"><span id="aL">&#9664;</span><span id="aR">&#9654;</span></div>
+</div>
+<div class="ctl">
+  <button id="start">Start</button>
+  <button id="recal" disabled>Recalibrate</button>
+</div>
+<div class="ctl">
+  Look-down sensitivity: <b id="sensVal">0.12</b><br>
+  <input id="sens" type="range" min="0.04" max="0.3" step="0.01" value="0.12">
+</div>
+<div class="ctl">
+  Look-sideways sensitivity: <b id="yawVal">0.12</b><br>
+  <input id="yaw" type="range" min="0.04" max="0.3" step="0.01" value="0.12">
+</div>
+<div id="msg">Hold the phone at eye level and look straight ahead for 2 seconds when calibrating. Left and right match your own left and right.</div>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const HOLD_SECONDS = 1.5, CALIBRATE_SECONDS = 2;
+const video = document.getElementById("video");
+const wrap = document.getElementById("wrap");
+const statusEl = document.getElementById("status");
+const sens = document.getElementById("sens");
+const yaw = document.getElementById("yaw");
+const aL = document.getElementById("aL");
+const aR = document.getElementById("aR");
+sens.oninput = () => document.getElementById("sensVal").textContent = sens.value;
+yaw.oninput = () => document.getElementById("yawVal").textContent = yaw.value;
+
+let landmarker, base = null, samples = [], calibStart = 0, dir = null, dirSince = null, audioCtx, lastBeep = 0;
+
+function setStatus(text, color, alert = false, side = null) {
+  statusEl.textContent = text;
+  statusEl.style.color = color;
+  wrap.classList.toggle("alert", alert);
+  aL.style.visibility = alert && side === "left" ? "visible" : "hidden";
+  aR.style.visibility = alert && side === "right" ? "visible" : "hidden";
+}
+
+function beep() {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator();
+    o.frequency.value = 880; o.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + 0.2);
+  } catch (e) {}
+  if (navigator.vibrate) navigator.vibrate(200);
+}
+
+// pitch: nose position between eye line and chin (bigger = looking down)
+// yaw: nose position between the two cheeks (about 0.5 when facing the camera)
+function measure(lm) {
+  const eyeY = (lm[33].y + lm[263].y) / 2;
+  const pitch = (lm[1].y - eyeY) / (lm[152].y - eyeY);
+  const yawR = (lm[1].x - lm[234].x) / (lm[454].x - lm[234].x);
+  return { pitch, yaw: yawR };
+}
+
+function recalibrate() { base = null; samples = []; calibStart = performance.now(); dir = null; dirSince = null; }
+
+async function start() {
+  setStatus("Loading model...", "#ff0");
+  const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  landmarker = await FaceLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task" },
+    runningMode: "VIDEO", numFaces: 1
+  });
+  video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" }, audio: false });
+  await video.play();
+  document.getElementById("recal").disabled = false;
+  recalibrate();
+  loop();
+}
+
+function loop() {
+  const now = performance.now();
+  const res = landmarker.detectForVideo(video, now);
+  if (res.faceLandmarks && res.faceLandmarks.length) {
+    const m = measure(res.faceLandmarks[0]);
+    if (base === null) {
+      samples.push(m);
+      setStatus("Calibrating... look straight ahead", "#ff0");
+      if (now - calibStart > CALIBRATE_SECONDS * 1000 && samples.length) {
+        base = {
+          pitch: samples.reduce((a, s) => a + s.pitch, 0) / samples.length,
+          yaw: samples.reduce((a, s) => a + s.yaw, 0) / samples.length
+        };
+      }
+    } else {
+      const t = parseFloat(sens.value), y = parseFloat(yaw.value);
+      let cur = null;
+      if (m.pitch > base.pitch + t) cur = "down";
+      else if (m.yaw > base.yaw + y) cur = "left";   // screen is mirrored: matches your own left
+      else if (m.yaw < base.yaw - y) cur = "right";
+
+      if (cur !== dir) { dir = cur; dirSince = cur ? now : null; }
+
+      if (!cur) {
+        setStatus("OK", "#0f0");
+      } else if (now - dirSince > HOLD_SECONDS * 1000) {
+        const label = cur === "down" ? "CHEATING: looking down!" :
+                      cur === "left" ? "CHEATING: looking LEFT!" : "CHEATING: looking RIGHT!";
+        setStatus(label, "#f33", true, cur);
+        if (now - lastBeep > 1000) { beep(); lastBeep = now; }
+      } else {
+        setStatus("Looking " + cur + "...", "#0ff");
+      }
+    }
+  } else {
+    dir = null; dirSince = null;
+    setStatus("No face detected", "#fa0");
+  }
+  requestAnimationFrame(loop);
+}
+
+document.getElementById("start").onclick = async (e) => {
+  e.target.disabled = true;
+  try { await start(); }
+  catch (err) { setStatus("Error: " + err.message, "#f55"); e.target.disabled = false; }
+};
+document.getElementById("recal").onclick = recalibrate;
+</script>
+</body>
+</html>
